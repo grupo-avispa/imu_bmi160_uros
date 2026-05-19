@@ -54,11 +54,15 @@ rcl_timer_t sync_timer;  ///< Timer for periodic time synchronization with agent
 rcl_publisher_t imu_publisher;
 sensor_msgs__msg__Imu msg;
 
+// Combined IMU data struct for atomic transfer between tasks
+struct IMUData {
+  AccelData accel;
+  GyroData gyro;
+};
+
 // FreeRTOS Task Management
-QueueHandle_t accel_data_queue;        ///< Queue for inter-task communication
-QueueHandle_t gyro_data_queue;         ///< Queue for inter-task communication
+QueueHandle_t imu_data_queue;          ///< Queue for inter-task communication
 TaskHandle_t i2cIMUTaskHandle;   ///< Handle for I2C IMU read task
-TaskHandle_t imuPublishTaskHandle; ///< Handle for IMU publish task
 TaskHandle_t rosTaskHandle;      ///< Handle for ROS executor task
 
 // Hardware Configuration
@@ -79,11 +83,7 @@ portMUX_TYPE timeSyncMutex = portMUX_INITIALIZER_UNLOCKED;
 volatile bool time_synchronized = false;
 
 // Mutexes for shared data access
-portMUX_TYPE imuMutex = portMUX_INITIALIZER_UNLOCKED;
-portMUX_TYPE msgMutex = portMUX_INITIALIZER_UNLOCKED;
-
-AccelData accel_data;  ///< Struct to hold accelerometer data
-GyroData gyro_data;  ///< Struct to hold gyroscope data
+SemaphoreHandle_t imu_mutex;  ///< FreeRTOS mutex for IMU data access
 
 BMI160 imu;  ///< BMI160 IMU sensor object
 calData cal_data = { 0 };  ///< Calibration data for IMU sensor
@@ -95,13 +95,7 @@ calData cal_data = { 0 };  ///< Calibration data for IMU sensor
 void I2CIMUTask(void* pvParameters);
 
 /**
- * @brief Task for publishing IMU messages to ROS2.
- * @param pvParameters Task parameters (unused).
- */
-void IMUPublishTask(void* pvParameters);
-
-/**
- * @brief Task for running the micro-ROS executor.
+ * @brief Task for running the micro-ROS executor and publishing IMU messages.
  * @param pvParameters Task parameters (expected value: 1).
  */
 void vTaskMicroROS(void* pvParameters);
@@ -118,7 +112,7 @@ void sync_timer_callback(rcl_timer_t* timer, int64_t last_call_time);
  */
 void setup() {
   // Initialize serial communication with PC
-  Serial.begin(115200);
+  Serial.begin(921600);
 
   // Initialize I2C communication for IMU
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -140,7 +134,7 @@ void setup() {
   // Configure micro-ROS WiFi transport to connect to ROS agent
   // Uncomment and update the following line with your transport settings
   // (e.g., WiFi credentials, agent IP/port)
-  //set_microros_wifi_transports(WIFI_SSID, WIFI_PASSWORD, AGENT_IP, AGENT_PORT);
+  // set_microros_wifi_transports(WIFI_SSID, WIFI_PASSWORD, AGENT_IP, AGENT_PORT);
   set_microros_serial_transports(Serial);
   Serial.println("micro-ROS configuration set...");
 
@@ -174,24 +168,24 @@ void setup() {
   // Add sync timer to executor
   RCCHECK(rclc_executor_add_timer(&executor, &sync_timer));
 
+  // Create FreeRTOS mutex for IMU shared data
+  imu_mutex = xSemaphoreCreateMutex();
+  if (imu_mutex == nullptr) {
+    Serial.println("ERROR: Failed to create IMU mutex");
+    error_loop();
+  }
+
   // Create FreeRTOS queue for communication between tasks
-  // Adjust queue size and item size according to your needs
-  accel_data_queue = xQueueCreate(1, sizeof(accel_data));
-  gyro_data_queue = xQueueCreate(1, sizeof(gyro_data));
+  imu_data_queue = xQueueCreate(1, sizeof(IMUData));
 
   // Create task for reading IMU I2C data (core 0, priority 1)
   xTaskCreatePinnedToCore(
     I2CIMUTask, "I2CIMUTask", 4096, NULL, 1, &i2cIMUTaskHandle, 0);
   Serial.println("I2C IMU read task created...");
 
-  // Create task for publishing the IMU message (core 1, priority 2)
+  // Create task for micro-ROS executor and IMU publishing (core 1, priority 2)
   xTaskCreatePinnedToCore(
-    IMUPublishTask, "IMUPublishTask", 4096, NULL, 2, &imuPublishTaskHandle, 1);
-  Serial.println("IMU publish task created...");
-
-  // Create task for micro-ROS executor (core 1, priority 3)
-  xTaskCreatePinnedToCore(
-      vTaskMicroROS, "vTaskMicroROS", 10000, (void *)1, 3, &rosTaskHandle, 1);
+      vTaskMicroROS, "vTaskMicroROS", 10000, (void *)1, 2, &rosTaskHandle, 1);
 
   if (rosTaskHandle == nullptr) {
     Serial.println("ERROR: Failed to create micro-ROS task");
@@ -209,40 +203,14 @@ void loop() {
 
 void vTaskMicroROS(void* pvParameters) {
   configASSERT(((uint32_t)pvParameters) == 1);
+  IMUData imu_data;
 
-  // Spin the micro-ROS executor
   for (;;) {
-    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100));
-    vTaskDelay(10);
-  }
-}
+    // Spin executor to handle timers (sync timer)
+    rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 
-void I2CIMUTask(void* pvParameters) {
-  while (true) {
-    portENTER_CRITICAL(&imuMutex);
-    imu.update();
-    imu.getAccel(&accel_data);
-    imu.getGyro(&gyro_data);
-    portEXIT_CRITICAL(&imuMutex);
-    xQueueOverwrite(accel_data_queue, &accel_data);  // Send latest data to publish task
-    xQueueOverwrite(gyro_data_queue, &gyro_data);  // Send latest data to publish task
-    vTaskDelay(10);  // Prevent watchdog timer issues
-  }
-}
-
-void IMUPublishTask(void* pvParameters) {
-  while (true) {
-    // Only publish if the time is synchronized with the ROS2 agent
-    if (!time_synchronized) {
-      Serial.println("Time not synchronized, skipping publish...");
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      continue;
-    }
-
-    // Attempt to dequeue data (500ms timeout)
-    // This prevents CPU polling/busy-waiting if the GPS is idle
-    if (xQueueReceive(accel_data_queue, &accel_data, pdMS_TO_TICKS(500)) == pdTRUE) {
-      // Synchronized timestamp
+    // Publish IMU data if time is synchronized and data is available
+    if (time_synchronized && xQueueReceive(imu_data_queue, &imu_data, 0) == pdTRUE) {
       portENTER_CRITICAL(&timeSyncMutex);
       int64_t synced_time_ns = ros_synced_time_ns;
       uint64_t sync_micros = micros_before_sync;
@@ -251,30 +219,37 @@ void IMUPublishTask(void* pvParameters) {
       uint64_t elapsed_micros = micros() - sync_micros;
       int64_t current_time_ns = synced_time_ns + (elapsed_micros * 1000);
 
-      // Filling the IMU message
       msg.header.stamp.sec = current_time_ns / 1000000000LL;
       msg.header.stamp.nanosec = current_time_ns % 1000000000LL;
       msg.header.frame_id.data = const_cast<char*>(ROS_FRAME_ID);
       msg.header.frame_id.size = strlen(ROS_FRAME_ID);
 
-      portENTER_CRITICAL(&imuMutex);
-      msg.linear_acceleration.x = 1.0;
-      msg.linear_acceleration.y = accel_data.accelY * 9.80665f;
-      msg.linear_acceleration.z = accel_data.accelZ * 9.80665f;
-      msg.angular_velocity.x = gyro_data.gyroX * (M_PI / 180.0f);
-      msg.angular_velocity.y = gyro_data.gyroY * (M_PI / 180.0f);
-      msg.angular_velocity.z = gyro_data.gyroZ * (M_PI / 180.0f);
-      Serial.print("Publishing IMU message with timestamp: ");
-      Serial.printf("%lld.%09lld\n", msg.header.stamp.sec, msg.header.stamp.nanosec);
-      Serial.printf("Accel (m/s^2): [%.2f, %.2f, %.2f], Gyro (rad/s): [%.2f, %.2f, %.2f]\n",
-                    msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z,
-                    msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z);
-      portEXIT_CRITICAL(&imuMutex);
+      msg.linear_acceleration.x = imu_data.accel.accelX * 9.80665f;
+      msg.linear_acceleration.y = imu_data.accel.accelY * 9.80665f;
+      msg.linear_acceleration.z = imu_data.accel.accelZ * 9.80665f;
+      msg.angular_velocity.x = imu_data.gyro.gyroX * (M_PI / 180.0f);
+      msg.angular_velocity.y = imu_data.gyro.gyroY * (M_PI / 180.0f);
+      msg.angular_velocity.z = imu_data.gyro.gyroZ * (M_PI / 180.0f);
 
-      rcl_ret_t ret = rcl_publish(&imu_publisher, &msg, NULL);
+      rcl_publish(&imu_publisher, &msg, NULL);
     }
-    // Short delay for FreeRTOS scheduling
-    vTaskDelay(pdMS_TO_TICKS(10)); 
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+void I2CIMUTask(void* pvParameters) {
+  IMUData imu_data;
+
+  while (true) {
+    if (xSemaphoreTake(imu_mutex, portMAX_DELAY) == pdTRUE) {
+      imu.update();
+      imu.getAccel(&imu_data.accel);
+      imu.getGyro(&imu_data.gyro);
+      xSemaphoreGive(imu_mutex);
+    }
+    xQueueOverwrite(imu_data_queue, &imu_data);  // Send latest data to publish task
+    vTaskDelay(pdMS_TO_TICKS(10));  // Prevent watchdog timer issues
   }
 }
 
