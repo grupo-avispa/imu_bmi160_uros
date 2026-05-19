@@ -70,6 +70,12 @@ constexpr uint32_t IMU_ADDRESS = 0x69;  ///< I2C address for BMI160 IMU
 constexpr uint8_t SDA_PIN = 21;  ///< SDA pin for I2C communication
 constexpr uint8_t SCL_PIN = 22;  ///< SCL pin for I2C communication
 
+// BMI160 Noise Parameters (datasheet, typical values)
+/// Gyroscope variance at ±2000 dps, 32 Hz BW: (0.007 * π/180)² * 32 ≈ 4.8e-7 (rad/s)²
+constexpr double GYRO_VARIANCE = 4.8e-7;
+/// Accelerometer variance at ±2g, 40 Hz BW: (180e-6 * 9.80665)² * 40 ≈ 1.25e-4 (m/s²)²
+constexpr double ACCEL_VARIANCE = 1.25e-4;
+
 // Time Synchronization Variables
 /// Timeout for ROS agent sync session in milliseconds
 const int SYNC_TIMEOUT_MS = 2000;
@@ -204,6 +210,20 @@ void loop() {
 void vTaskMicroROS(void* pvParameters) {
   configASSERT(((uint32_t)pvParameters) == 1);
   IMUData imu_data;
+
+  // Initialize covariance matrices once (BMI160 datasheet typical values)
+  // Orientation is not available from BMI160 (no onboard fusion)
+  msg.orientation_covariance[0] = -1.0;
+
+  // Gyroscope covariance: diagonal matrix, (rad/s)²
+  msg.angular_velocity_covariance[0] = GYRO_VARIANCE;
+  msg.angular_velocity_covariance[4] = GYRO_VARIANCE;
+  msg.angular_velocity_covariance[8] = GYRO_VARIANCE;
+
+  // Accelerometer covariance: diagonal matrix, (m/s²)²
+  msg.linear_acceleration_covariance[0] = ACCEL_VARIANCE;
+  msg.linear_acceleration_covariance[4] = ACCEL_VARIANCE;
+  msg.linear_acceleration_covariance[8] = ACCEL_VARIANCE;
 
   for (;;) {
     // Spin executor to handle timers (sync timer)
