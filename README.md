@@ -1,6 +1,7 @@
 # imu_bmi160_uros
 ![ROS2](https://img.shields.io/badge/ros2-jazzy-blue?logo=ros&logoColor=white)
 ![License](https://img.shields.io/github/license/grupo-avispa/imu_bmi160_uros)
+[![Build](https://github.com/grupo-avispa/imu_bmi160_uros/actions/workflows/build.yml/badge.svg)](https://github.com/grupo-avispa/imu_bmi160_uros/actions/workflows/build.yml)
 
 
 ## Overview
